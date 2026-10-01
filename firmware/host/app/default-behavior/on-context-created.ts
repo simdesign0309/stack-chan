@@ -10,6 +10,7 @@ import { localize } from 'localization'
 import config from 'mc/config'
 import type { Content as PiuContent } from 'piu/MC'
 import { randomBetween, wait } from 'stackchan-util'
+import Time from 'time'
 import Timer from 'timer'
 
 const FORWARD = {
@@ -47,6 +48,9 @@ const TOUCH_PANEL_PETTING_WINDOW_MS = 1500
 const TOUCH_PANEL_HAPPY_DURATION_MS = 5000
 const TOUCH_PANEL_PET_MOTION_STEP_MS = 220
 const TOUCH_PANEL_PET_MOTION_STEP_SEC = TOUCH_PANEL_PET_MOTION_STEP_MS / 1000
+
+// 首を動かし終えてから、IMUの読みが落ち着くまでの猶予。
+const HEAD_MOTION_SETTLE_MS = 600
 const MOTION_DETECT_COLD_DURATION_MS = 5000
 const SPEECH_SYNTHESIS_TEXT = 'こんにちわ。すたっくちゃんです。'
 
@@ -74,6 +78,18 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
   let pettingPreviousEmotion: Emotion | undefined
   let pettingPreviousRotation: typeof robot.pose.body.rotation | undefined
   let pettingMotionActive = false
+  // StackChan CoreS3はIMUを積んだ本体がそのまま頭なので、首を動かすとIMUも一緒に傾く。
+  // 見上げた姿勢がfallenBackwardと読まれるため、自分で動かしている間の姿勢判定は信用しない。
+  let headMotionDepth = 0
+  let headSettleUntil = 0
+  const beginHeadMotion = () => {
+    headMotionDepth += 1
+  }
+  const endHeadMotion = () => {
+    headMotionDepth = Math.max(0, headMotionDepth - 1)
+    headSettleUntil = Time.ticks + HEAD_MOTION_SETTLE_MS
+  }
+  const isHeadMoving = () => headMotionDepth > 0 || Time.ticks < headSettleUntil
   let pettingHoldTimer: ReturnType<typeof Timer.set> | undefined
   let motionDetectRestoreTimer: ReturnType<typeof Timer.set> | undefined
   let motionDetectPreviousEmotion: Emotion | undefined
@@ -105,6 +121,7 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
     rotation,
   })
   const runPettingHoldMotion = async (upRotation: typeof robot.pose.body.rotation) => {
+    beginHeadMotion()
     try {
       await robot.setPose(poseForRotation(upRotation), TOUCH_PANEL_PET_MOTION_STEP_SEC)
     } catch (error) {
@@ -114,6 +131,8 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
       } catch (torqueError) {
         trace(`[TouchPanel] pet hold torque release error ${errorMessage(torqueError)}\n`)
       }
+    } finally {
+      endHeadMotion()
     }
   }
   const runPettingMotion = async (
@@ -121,6 +140,7 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
     leftRight: (direction: number) => typeof robot.pose.body.rotation,
     firstDirection: number,
   ) => {
+    beginHeadMotion()
     try {
       await robot.setTorque(true)
       // Multiple visible steps make this read as head shaking, not a single pose change.
@@ -144,10 +164,12 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
         trace(`[TouchPanel] pet motion torque release error ${errorMessage(torqueError)}\n`)
       }
     } finally {
+      endHeadMotion()
       pettingMotionActive = false
     }
   }
   const runPettingRestoreMotion = async (rotation: typeof robot.pose.body.rotation) => {
+    beginHeadMotion()
     try {
       await robot.setPose(poseForRotation(rotation), TOUCH_PANEL_PET_MOTION_STEP_SEC)
     } catch (error) {
@@ -158,6 +180,7 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
       } catch (torqueError) {
         trace(`[TouchPanel] restore torque release error ${errorMessage(torqueError)}\n`)
       }
+      endHeadMotion()
     }
   }
 
@@ -414,6 +437,7 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
   const runServoTest = async () => {
     if (isMoving) return
     isMoving = true
+    beginHeadMotion()
     let failed = false
     const rotations = [LEFT, RIGHT, DOWN, UP, FORWARD]
     try {
@@ -438,6 +462,7 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
         trace(`[ServoTest] torque release error ${errorMessage(error)}\n`)
         robot.showBalloon('servo error')
       }
+      endHeadMotion()
       isMoving = false
       if (failed) {
         Timer.set(() => robot.hideBalloon(), 1200)
@@ -593,6 +618,12 @@ export const onContextCreated: NonNullable<StackchanAppBehavior['onContextCreate
     robot.imu.start()
     robot.imu.onEvent = (event) => {
       const type = event.motion
+      // IMUは頭そのものに入っているため、自分で首を振っただけでも転倒と読まれる。
+      // 動かしている間とその直後は姿勢の判定材料にしない。
+      if (isHeadMoving()) {
+        trace(`[IMU] ignored while the head is moving: ${type}\n`)
+        return
+      }
       trace(`[IMU] motion detected: ${type}\n`)
       if (motionDetectPreviousEmotion === undefined) motionDetectPreviousEmotion = currentEmotion
       if (motionDetectRestoreTimer) Timer.clear(motionDetectRestoreTimer)
